@@ -1,24 +1,18 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'CloudFormation template for public x86_64 Ubuntu spot instance with Amazon Q CLI and Docker in us-east-1 region'
+Description: 'CloudFormation template for public x86_64 Ubuntu spot instance with Amazon Q CLI and Docker in us-west-2 region with mixed instance types'
 
 Parameters:
   SpotPrice:
     Description: Maximum spot price for the instance (USD per hour)
     Type: String
-    Default: '0.15'
+    Default: '0.25'
   
   KeyName:
     Description: Name of the SSH key pair
     Type: String
-    Default: 'amazon-q-key'
+    Default: 'amazon-q-key-uswest2'
 
 Resources:
-  # SSH Key Pair
-  SSHKeyPair:
-    Type: AWS::EC2::KeyPair
-    Properties:
-      KeyName: !Ref KeyName
-
   # VPC and Networking Resources
   VPC:
     Type: AWS::EC2::VPC
@@ -28,7 +22,7 @@ Resources:
       EnableDnsHostnames: true
       Tags:
         - Key: Name
-          Value: AmazonQ-VPC
+          Value: AmazonQ-VPC-USWest2
 
   # Create subnets in all availability zones
   PublicSubnetA:
@@ -40,7 +34,7 @@ Resources:
       AvailabilityZone: !Select [0, !GetAZs '']
       Tags:
         - Key: Name
-          Value: AmazonQ-PublicSubnet-A
+          Value: AmazonQ-PublicSubnet-A-USWest2
 
   PublicSubnetB:
     Type: AWS::EC2::Subnet
@@ -51,7 +45,7 @@ Resources:
       AvailabilityZone: !Select [1, !GetAZs '']
       Tags:
         - Key: Name
-          Value: AmazonQ-PublicSubnet-B
+          Value: AmazonQ-PublicSubnet-B-USWest2
 
   PublicSubnetC:
     Type: AWS::EC2::Subnet
@@ -62,14 +56,25 @@ Resources:
       AvailabilityZone: !Select [2, !GetAZs '']
       Tags:
         - Key: Name
-          Value: AmazonQ-PublicSubnet-C
+          Value: AmazonQ-PublicSubnet-C-USWest2
+
+  PublicSubnetD:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [3, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: AmazonQ-PublicSubnet-D-USWest2
 
   InternetGateway:
     Type: AWS::EC2::InternetGateway
     Properties:
       Tags:
         - Key: Name
-          Value: AmazonQ-IGW
+          Value: AmazonQ-IGW-USWest2
 
   AttachGateway:
     Type: AWS::EC2::VPCGatewayAttachment
@@ -83,7 +88,7 @@ Resources:
       VpcId: !Ref VPC
       Tags:
         - Key: Name
-          Value: AmazonQ-RouteTable
+          Value: AmazonQ-RouteTable-USWest2
 
   DefaultRoute:
     Type: AWS::EC2::Route
@@ -111,6 +116,12 @@ Resources:
       SubnetId: !Ref PublicSubnetC
       RouteTableId: !Ref RouteTable
 
+  SubnetRouteTableAssociationD:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetD
+      RouteTableId: !Ref RouteTable
+
   # Admin Job Role with administrative permissions
   AdminJobRole:
     Type: AWS::IAM::Role
@@ -136,6 +147,21 @@ Resources:
       Roles:
         - !Ref AdminJobRole
 
+  # Spot Fleet Role
+  SpotFleetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: spotfleet.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+      Path: /
+
   InstanceSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -154,24 +180,24 @@ Resources:
           CidrIp: 0.0.0.0/0
           Description: Allow all outbound traffic
 
-  # Spot Instance Request
+  # Spot Instance Request with Mixed Instance Types
   SpotInstanceRequest:
     Type: AWS::EC2::SpotFleet
     Properties:
       SpotFleetRequestConfigData:
         IamFleetRole: !GetAtt SpotFleetRole.Arn
         TargetCapacity: 1
-        AllocationStrategy: lowestPrice
+        AllocationStrategy: diversified
         TerminateInstancesWithExpiration: false
         Type: maintain
         ReplaceUnhealthyInstances: true
         LaunchSpecifications:
-          # Try m7i.2xlarge in all three AZs
-          - InstanceType: m7i.2xlarge
+          # m5.2xlarge in subnet A (us-west-2a)
+          - InstanceType: m5.2xlarge
             SubnetId: !Ref PublicSubnetA
             SecurityGroups:
               - GroupId: !GetAtt InstanceSecurityGroup.GroupId
-            ImageId: ami-0a7d80731ae1b2435  # Latest Ubuntu 22.04 LTS x86_64 AMI in us-east-1
+            ImageId: ami-0ec1bf4a8f92e7bd1  # Latest Ubuntu 22.04 LTS x86_64 AMI in us-west-2
             KeyName: !Ref KeyName
             IamInstanceProfile:
               Arn: !GetAtt AdminInstanceProfile.Arn
@@ -216,7 +242,6 @@ Resources:
                 ./aws/install
                 
                 # Install SSM Agent (required for SSM connectivity)
-                # Skip if already installed via snap
                 if ! snap list amazon-ssm-agent &>/dev/null; then
                   mkdir -p /tmp/ssm
                   cd /tmp/ssm
@@ -252,7 +277,7 @@ Resources:
                 npm install -g @angular/cli
                 npm install -g create-react-app
                 
-                # Install Amazon Q CLI using the .deb package (more reliable than tar.gz)
+                # Install Amazon Q CLI using the .deb package
                 cd /tmp
                 wget https://desktop-release.q.us-east-1.amazonaws.com/latest/amazon-q.deb
                 apt-get install -f -y
@@ -283,7 +308,7 @@ Resources:
                 cat > /etc/motd << 'EOT'
                 
                 =====================================================
-                Welcome to Amazon Q CLI on Ubuntu (m7i.2xlarge Spot Instance)
+                Welcome to Amazon Q CLI on Ubuntu (m5.2xlarge - us-west-2a)
                 =====================================================
                 
                 PUBLIC ADMIN INSTANCE: This instance has administrative permissions
@@ -311,14 +336,14 @@ Resources:
                   - Run 'sudo /usr/local/bin/stop-instance.sh' to stop this instance
                   - Run 'sudo /usr/local/bin/start-instance.sh' to start this instance
                 
-                Note: This is a spot instance and may be interrupted if spot prices exceed your maximum bid.
+                Note: This is a spot instance with mixed instance types for better availability.
                 
                 =====================================================
                 
                 EOT
                 
                 # Install CloudWatch agent
-                wget https://amazoncloudwatch-agent-us-east-1.s3.us-east-1.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+                wget https://amazoncloudwatch-agent-us-west-2.s3.us-west-2.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
                 dpkg -i amazon-cloudwatch-agent.deb || true
                 
                 # Configure CloudWatch agent
@@ -355,46 +380,190 @@ Resources:
                 # Create admin job role indicator file
                 echo "This instance has the AdminJobRole attached" > /etc/admin-role-enabled
                 
+                # Configure SSH for Amazon Q CLI
+                echo "AcceptEnv Q_SET_PARENT" >> /etc/ssh/sshd_config
+                echo "AllowStreamLocalForwarding yes" >> /etc/ssh/sshd_config
+                systemctl restart sshd
+                
+                # Install Q CLI dotfile integration
+                sudo -u ubuntu q integrations install dotfile
+                
                 # Tag the instance
                 INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
                 REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
-                aws ec2 create-tags --resources $INSTANCE_ID --tags Key=Name,Value=AmazonQ-CLI-Docker-Instance Key=Role,Value=AdminJobRole --region $REGION
+                aws ec2 create-tags --resources $INSTANCE_ID --tags Key=Name,Value=AmazonQ-CLI-Docker-Instance-USWest2 Key=Role,Value=AdminJobRole --region $REGION
+          # m5a.2xlarge in subnet B (us-west-2b) - AMD-based alternative
+          - InstanceType: m5a.2xlarge
+            SubnetId: !Ref PublicSubnetB
+            SecurityGroups:
+              - GroupId: !GetAtt InstanceSecurityGroup.GroupId
+            ImageId: ami-0ec1bf4a8f92e7bd1
+            KeyName: !Ref KeyName
+            IamInstanceProfile:
+              Arn: !GetAtt AdminInstanceProfile.Arn
+            BlockDeviceMappings:
+              - DeviceName: /dev/sda1
+                Ebs:
+                  VolumeSize: 40
+                  VolumeType: gp3
+                  DeleteOnTermination: true
+                  Encrypted: true
+            SpotPrice: !Ref SpotPrice
+            UserData:
+              Fn::Base64: !Sub |
+                #!/bin/bash -xe
+                apt-get update && apt-get upgrade -y
+                apt-get install -y unzip curl wget jq apt-transport-https ca-certificates software-properties-common gnupg lsb-release
+                mkdir -p /etc/apt/keyrings
+                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+                apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+                usermod -aG docker ubuntu && systemctl enable docker && systemctl start docker
+                curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && unzip awscliv2.zip && ./aws/install
+                apt-get install -y python3 python3-pip python3-venv && pip3 install uv
+                curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs
+                npm install -g npm@latest typescript @vue/cli @angular/cli create-react-app
+                cd /tmp && wget https://desktop-release.q.us-east-1.amazonaws.com/latest/amazon-q.deb && apt-get install -f -y && dpkg -i amazon-q.deb
+                echo "Welcome to Amazon Q CLI on Ubuntu (m5a.2xlarge AMD - us-west-2b)" > /etc/motd
+                INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+                REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+                # Configure SSH for Amazon Q CLI
+                echo "AcceptEnv Q_SET_PARENT" >> /etc/ssh/sshd_config
+                echo "AllowStreamLocalForwarding yes" >> /etc/ssh/sshd_config
+                systemctl restart sshd
+                
+                # Install Q CLI dotfile integration
+                sudo -u ubuntu q integrations install dotfile
+                
+                aws ec2 create-tags --resources $INSTANCE_ID --tags Key=Name,Value=AmazonQ-CLI-Docker-Instance-USWest2-AMD Key=Role,Value=AdminJobRole --region $REGION
 
-  # IAM Role for Spot Fleet
-  SpotFleetRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: spotfleet.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+          # m4.2xlarge in subnet C (us-west-2c) - Older generation, more stable
+          - InstanceType: m4.2xlarge
+            SubnetId: !Ref PublicSubnetC
+            SecurityGroups:
+              - GroupId: !GetAtt InstanceSecurityGroup.GroupId
+            ImageId: ami-0ec1bf4a8f92e7bd1
+            KeyName: !Ref KeyName
+            IamInstanceProfile:
+              Arn: !GetAtt AdminInstanceProfile.Arn
+            BlockDeviceMappings:
+              - DeviceName: /dev/sda1
+                Ebs:
+                  VolumeSize: 40
+                  VolumeType: gp3
+                  DeleteOnTermination: true
+                  Encrypted: true
+            SpotPrice: !Ref SpotPrice
+            UserData:
+              Fn::Base64: !Sub |
+                #!/bin/bash -xe
+                apt-get update && apt-get upgrade -y
+                apt-get install -y unzip curl wget jq apt-transport-https ca-certificates software-properties-common gnupg lsb-release
+                mkdir -p /etc/apt/keyrings
+                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+                apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+                usermod -aG docker ubuntu && systemctl enable docker && systemctl start docker
+                curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && unzip awscliv2.zip && ./aws/install
+                apt-get install -y python3 python3-pip python3-venv && pip3 install uv
+                curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs
+                cd /tmp && wget https://desktop-release.q.us-east-1.amazonaws.com/latest/amazon-q.deb && apt-get install -f -y && dpkg -i amazon-q.deb
+                echo "Welcome to Amazon Q CLI on Ubuntu (m4.2xlarge - us-west-2c)" > /etc/motd
+                INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+                REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+                # Configure SSH for Amazon Q CLI
+                echo "AcceptEnv Q_SET_PARENT" >> /etc/ssh/sshd_config
+                echo "AllowStreamLocalForwarding yes" >> /etc/ssh/sshd_config
+                systemctl restart sshd
+                
+                # Install Q CLI dotfile integration
+                sudo -u ubuntu q integrations install dotfile
+                
+                aws ec2 create-tags --resources $INSTANCE_ID --tags Key=Name,Value=AmazonQ-CLI-Docker-Instance-USWest2-M4 Key=Role,Value=AdminJobRole --region $REGION
+
+          # c5.2xlarge in subnet D (us-west-2d) - Compute optimized alternative
+          - InstanceType: c5.2xlarge
+            SubnetId: !Ref PublicSubnetD
+            SecurityGroups:
+              - GroupId: !GetAtt InstanceSecurityGroup.GroupId
+            ImageId: ami-0ec1bf4a8f92e7bd1
+            KeyName: !Ref KeyName
+            IamInstanceProfile:
+              Arn: !GetAtt AdminInstanceProfile.Arn
+            BlockDeviceMappings:
+              - DeviceName: /dev/sda1
+                Ebs:
+                  VolumeSize: 40
+                  VolumeType: gp3
+                  DeleteOnTermination: true
+                  Encrypted: true
+            SpotPrice: !Ref SpotPrice
+            UserData:
+              Fn::Base64: !Sub |
+                #!/bin/bash -xe
+                apt-get update && apt-get upgrade -y
+                apt-get install -y unzip curl wget jq docker.io python3 python3-pip nodejs npm
+                systemctl enable docker && systemctl start docker && usermod -aG docker ubuntu
+                curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" && unzip awscliv2.zip && ./aws/install
+                pip3 install uv
+                cd /tmp && wget https://desktop-release.q.us-east-1.amazonaws.com/latest/amazon-q.deb && apt-get install -f -y && dpkg -i amazon-q.deb
+                echo "Welcome to Amazon Q CLI on Ubuntu (c5.2xlarge Compute Optimized - us-west-2d)" > /etc/motd
+                INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+                REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+                # Configure SSH for Amazon Q CLI
+                echo "AcceptEnv Q_SET_PARENT" >> /etc/ssh/sshd_config
+                echo "AllowStreamLocalForwarding yes" >> /etc/ssh/sshd_config
+                systemctl restart sshd
+                
+                # Install Q CLI dotfile integration
+                sudo -u ubuntu q integrations install dotfile
+                
+                aws ec2 create-tags --resources $INSTANCE_ID --tags Key=Name,Value=AmazonQ-CLI-Docker-Instance-USWest2-C5 Key=Role,Value=AdminJobRole --region $REGION
 
 Outputs:
   SpotFleetRequestId:
     Description: ID of the Spot Fleet Request
     Value: !Ref SpotInstanceRequest
-    
-  AdminRoleArn:
-    Description: ARN of the Admin Job Role
-    Value: !GetAtt AdminJobRole.Arn
-    
-  VpcId:
-    Description: ID of the VPC created
+    Export:
+      Name: !Sub "${AWS::StackName}-SpotFleetRequestId"
+
+  VPCId:
+    Description: VPC ID
     Value: !Ref VPC
-    
-  SubnetIds:
-    Description: IDs of the public subnets created
-    Value: !Join [", ", [!Ref PublicSubnetA, !Ref PublicSubnetB, !Ref PublicSubnetC]]
-    
+    Export:
+      Name: !Sub "${AWS::StackName}-VPCId"
+
+  SecurityGroupId:
+    Description: Security Group ID
+    Value: !Ref InstanceSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroupId"
+
   KeyPairName:
-    Description: Name of the SSH key pair
+    Description: SSH Key Pair Name
     Value: !Ref KeyName
-    
-  KeyPairId:
-    Description: ID of the SSH key pair
-    Value: !Ref SSHKeyPair
+    Export:
+      Name: !Sub "${AWS::StackName}-KeyPairName"
+
+  Region:
+    Description: Deployment Region
+    Value: !Ref "AWS::Region"
+    Export:
+      Name: !Sub "${AWS::StackName}-Region"
+
+  InstanceTypes:
+    Description: Mixed instance types used in this deployment
+    Value: "m5.2xlarge, m5a.2xlarge, m4.2xlarge, c5.2xlarge"
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceTypes"
+
+  AvailabilityZones:
+    Description: Availability zones used
+    Value: !Join
+      - ", "
+      - - !GetAtt PublicSubnetA.AvailabilityZone
+        - !GetAtt PublicSubnetB.AvailabilityZone
+        - !GetAtt PublicSubnetC.AvailabilityZone
+        - !GetAtt PublicSubnetD.AvailabilityZone
+    Export:
+      Name: !Sub "${AWS::StackName}-AvailabilityZones"
