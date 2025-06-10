@@ -1,0 +1,400 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for public x86_64 Ubuntu spot instance with Amazon Q CLI and Docker in us-east-1 region'
+
+Parameters:
+  SpotPrice:
+    Description: Maximum spot price for the instance (USD per hour)
+    Type: String
+    Default: '0.15'
+  
+  KeyName:
+    Description: Name of the SSH key pair
+    Type: String
+    Default: 'amazon-q-key'
+
+Resources:
+  # SSH Key Pair
+  SSHKeyPair:
+    Type: AWS::EC2::KeyPair
+    Properties:
+      KeyName: !Ref KeyName
+
+  # VPC and Networking Resources
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: AmazonQ-VPC
+
+  # Create subnets in all availability zones
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: AmazonQ-PublicSubnet-A
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: AmazonQ-PublicSubnet-B
+
+  PublicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [2, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: AmazonQ-PublicSubnet-C
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: AmazonQ-IGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: AmazonQ-RouteTable
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref RouteTable
+
+  SubnetRouteTableAssociationB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref RouteTable
+
+  SubnetRouteTableAssociationC:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetC
+      RouteTableId: !Ref RouteTable
+
+  # Admin Job Role with administrative permissions
+  AdminJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess  # Full admin access
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore  # Required for SSM
+      Path: /
+      RoleName: !Sub "${AWS::StackName}-AdminRole"
+
+  # Instance profile for the admin job role
+  AdminInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref AdminJobRole
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for public instance with SSH and SSM access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: Allow SSH access from anywhere
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+
+  # Spot Instance Request
+  SpotInstanceRequest:
+    Type: AWS::EC2::SpotFleet
+    Properties:
+      SpotFleetRequestConfigData:
+        IamFleetRole: !GetAtt SpotFleetRole.Arn
+        TargetCapacity: 1
+        AllocationStrategy: lowestPrice
+        TerminateInstancesWithExpiration: false
+        Type: maintain
+        ReplaceUnhealthyInstances: true
+        LaunchSpecifications:
+          # Try m7i.2xlarge in all three AZs
+          - InstanceType: m7i.2xlarge
+            SubnetId: !Ref PublicSubnetA
+            SecurityGroups:
+              - GroupId: !GetAtt InstanceSecurityGroup.GroupId
+            ImageId: ami-0a7d80731ae1b2435  # Latest Ubuntu 22.04 LTS x86_64 AMI in us-east-1
+            KeyName: !Ref KeyName
+            IamInstanceProfile:
+              Arn: !GetAtt AdminInstanceProfile.Arn
+            BlockDeviceMappings:
+              - DeviceName: /dev/sda1
+                Ebs:
+                  VolumeSize: 40
+                  VolumeType: gp3
+                  DeleteOnTermination: true
+                  Encrypted: true
+            SpotPrice: !Ref SpotPrice
+            UserData:
+              Fn::Base64: !Sub |
+                #!/bin/bash -xe
+                
+                # Update system packages
+                apt-get update
+                apt-get upgrade -y
+                
+                # Install required packages
+                apt-get install -y unzip curl wget jq apt-transport-https ca-certificates software-properties-common gnupg lsb-release
+
+                # Install Docker
+                mkdir -p /etc/apt/keyrings
+                curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+                echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+                apt-get update
+                apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+                usermod -aG docker ubuntu
+                systemctl enable docker
+                systemctl start docker
+
+                # Install Docker Compose v2
+                mkdir -p /usr/local/lib/docker/cli-plugins
+                curl -SL "https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-linux-x86_64" -o /usr/local/lib/docker/cli-plugins/docker-compose
+                chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+                ln -sf /usr/local/lib/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose
+
+                # Install AWS CLI
+                curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                unzip awscliv2.zip
+                ./aws/install
+                
+                # Install SSM Agent (required for SSM connectivity)
+                # Skip if already installed via snap
+                if ! snap list amazon-ssm-agent &>/dev/null; then
+                  mkdir -p /tmp/ssm
+                  cd /tmp/ssm
+                  wget https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/debian_amd64/amazon-ssm-agent.deb
+                  dpkg -i amazon-ssm-agent.deb || true
+                  systemctl enable amazon-ssm-agent
+                  systemctl start amazon-ssm-agent
+                fi
+                
+                # Install Python 3 and pip
+                apt-get install -y python3 python3-pip python3-venv
+                
+                # Install uv (Python package installer/resolver)
+                pip3 install uv
+                
+                # Update PATH environment variable for all users
+                echo 'export PATH="$HOME/.local/bin:$PATH"' >> /etc/profile.d/custom_path.sh
+                chmod +x /etc/profile.d/custom_path.sh
+                source /etc/profile.d/custom_path.sh
+                
+                # Also add to .bashrc for the ubuntu user
+                echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/ubuntu/.bashrc
+                chown ubuntu:ubuntu /home/ubuntu/.bashrc
+                
+                # Install Node.js and npm
+                curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+                apt-get install -y nodejs
+                npm install -g npm@latest
+                
+                # Install common global npm packages
+                npm install -g typescript
+                npm install -g @vue/cli
+                npm install -g @angular/cli
+                npm install -g create-react-app
+                
+                # Install Amazon Q CLI using the .deb package (more reliable than tar.gz)
+                cd /tmp
+                wget https://desktop-release.q.us-east-1.amazonaws.com/latest/amazon-q.deb
+                apt-get install -f -y
+                dpkg -i amazon-q.deb
+                
+                # Create start/stop scripts in /usr/local/bin
+                cat > /usr/local/bin/start-instance.sh << 'EOT'
+                #!/bin/bash
+                INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+                REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+                aws ec2 start-instances --instance-ids $INSTANCE_ID --region $REGION
+                echo "Instance $INSTANCE_ID starting..."
+                EOT
+                
+                cat > /usr/local/bin/stop-instance.sh << 'EOT'
+                #!/bin/bash
+                INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+                REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+                aws ec2 stop-instances --instance-ids $INSTANCE_ID --region $REGION
+                echo "Instance $INSTANCE_ID stopping..."
+                EOT
+                
+                # Make scripts executable
+                chmod +x /usr/local/bin/start-instance.sh
+                chmod +x /usr/local/bin/stop-instance.sh
+                
+                # Create a welcome message with usage instructions
+                cat > /etc/motd << 'EOT'
+                
+                =====================================================
+                Welcome to Amazon Q CLI on Ubuntu (m7i.2xlarge Spot Instance)
+                =====================================================
+                
+                PUBLIC ADMIN INSTANCE: This instance has administrative permissions
+                and is accessible via SSH and AWS Systems Manager (SSM)
+                
+                To use Amazon Q CLI:
+                  - Run 'q chat' to start a chat session
+                  - Run 'q --help' for more options
+                
+                Docker and Docker Compose are installed:
+                  - Docker version: $(docker --version)
+                  - Docker Compose version: $(docker compose version)
+                
+                Python and uv are installed:
+                  - Python version: $(python3 --version)
+                  - uv version: $(uv --version)
+                  - PATH includes $HOME/.local/bin
+                
+                Node.js and npm are also installed:
+                  - Node.js version: $(node -v)
+                  - npm version: $(npm -v)
+                  - Global packages: typescript, @vue/cli, @angular/cli, create-react-app
+                
+                To manage this instance:
+                  - Run 'sudo /usr/local/bin/stop-instance.sh' to stop this instance
+                  - Run 'sudo /usr/local/bin/start-instance.sh' to start this instance
+                
+                Note: This is a spot instance and may be interrupted if spot prices exceed your maximum bid.
+                
+                =====================================================
+                
+                EOT
+                
+                # Install CloudWatch agent
+                wget https://amazoncloudwatch-agent-us-east-1.s3.us-east-1.amazonaws.com/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+                dpkg -i amazon-cloudwatch-agent.deb || true
+                
+                # Configure CloudWatch agent
+                cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOT'
+                {
+                  "agent": {
+                    "metrics_collection_interval": 60,
+                    "run_as_user": "root"
+                  },
+                  "metrics": {
+                    "metrics_collected": {
+                      "mem": {
+                        "measurement": ["mem_used_percent"],
+                        "metrics_collection_interval": 60
+                      },
+                      "swap": {
+                        "measurement": ["swap_used_percent"],
+                        "metrics_collection_interval": 60
+                      },
+                      "disk": {
+                        "measurement": ["used_percent"],
+                        "metrics_collection_interval": 60,
+                        "resources": ["*"]
+                      }
+                    }
+                  }
+                }
+                EOT
+                
+                # Start CloudWatch agent
+                systemctl enable amazon-cloudwatch-agent || true
+                systemctl start amazon-cloudwatch-agent || true
+                
+                # Create admin job role indicator file
+                echo "This instance has the AdminJobRole attached" > /etc/admin-role-enabled
+                
+                # Tag the instance
+                INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+                REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+                aws ec2 create-tags --resources $INSTANCE_ID --tags Key=Name,Value=AmazonQ-CLI-Docker-Instance Key=Role,Value=AdminJobRole --region $REGION
+
+  # IAM Role for Spot Fleet
+  SpotFleetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: spotfleet.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+
+Outputs:
+  SpotFleetRequestId:
+    Description: ID of the Spot Fleet Request
+    Value: !Ref SpotInstanceRequest
+    
+  AdminRoleArn:
+    Description: ARN of the Admin Job Role
+    Value: !GetAtt AdminJobRole.Arn
+    
+  VpcId:
+    Description: ID of the VPC created
+    Value: !Ref VPC
+    
+  SubnetIds:
+    Description: IDs of the public subnets created
+    Value: !Join [", ", [!Ref PublicSubnetA, !Ref PublicSubnetB, !Ref PublicSubnetC]]
+    
+  KeyPairName:
+    Description: Name of the SSH key pair
+    Value: !Ref KeyName
+    
+  KeyPairId:
+    Description: ID of the SSH key pair
+    Value: !Ref SSHKeyPair
