@@ -11,6 +11,34 @@ Parameters:
     Description: Name of the SSH key pair
     Type: String
     Default: 'amazon-q-key-uswest2'
+    
+  InstanceType:
+    Description: EC2 instance type for development environment (only used when Environment=Development)
+    Type: String
+    Default: 'm5.4xlarge'
+    AllowedValues:
+      - 'm5.2xlarge'
+      - 'm5.4xlarge'
+      - 'm5a.4xlarge'
+      - 'c5.4xlarge'
+      - 'r5.4xlarge'
+  
+  VolumeSize:
+    Description: EBS volume size in GB for development environment (only used when Environment=Development)
+    Type: String
+    Default: '100'
+    
+  Environment:
+    Description: Deployment environment type
+    Type: String
+    Default: 'Production'
+    AllowedValues:
+      - 'Production'
+      - 'Development'
+
+Conditions:
+  IsProductionEnvironment: !Equals [!Ref Environment, 'Production']
+  IsDevelopmentEnvironment: !Equals [!Ref Environment, 'Development']
 
 Resources:
   # VPC and Networking Resources
@@ -173,6 +201,11 @@ Resources:
           ToPort: 22
           CidrIp: 0.0.0.0/0
           Description: Allow SSH access from anywhere
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+          Description: Allow VS Code Server access (only used for development)
       SecurityGroupEgress:
         - IpProtocol: -1
           FromPort: -1
@@ -180,9 +213,10 @@ Resources:
           CidrIp: 0.0.0.0/0
           Description: Allow all outbound traffic
 
-  # Spot Instance Request with Mixed Instance Types
+  # Spot Instance Request with Mixed Instance Types (only created when Environment=Production)
   SpotInstanceRequest:
     Type: AWS::EC2::SpotFleet
+    Condition: IsProductionEnvironment
     Properties:
       SpotFleetRequestConfigData:
         IamFleetRole: !GetAtt SpotFleetRole.Arn
