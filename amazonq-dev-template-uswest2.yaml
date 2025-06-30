@@ -1,0 +1,424 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Amazon Q CLI feature development environment in us-west-2 region'
+
+Parameters:
+  SpotPrice:
+    Description: Maximum spot price for the instance (USD per hour)
+    Type: String
+    Default: '0.25'
+  
+  KeyName:
+    Description: Name of the SSH key pair
+    Type: String
+    Default: 'amazon-q-key-uswest2'
+    
+  InstanceType:
+    Description: EC2 instance type for development environment
+    Type: String
+    Default: 'm5.4xlarge'
+    AllowedValues:
+      - 'm5.2xlarge'
+      - 'm5.4xlarge'
+      - 'm5a.4xlarge'
+      - 'c5.4xlarge'
+      - 'r5.4xlarge'
+  
+  VolumeSize:
+    Description: EBS volume size in GB for development environment
+    Type: String
+    Default: '100'
+
+Resources:
+  # VPC and Networking Resources
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: AmazonQ-Dev-VPC-USWest2
+
+  # Create subnets in all availability zones
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: AmazonQ-Dev-PublicSubnet-A-USWest2
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: AmazonQ-Dev-IGW-USWest2
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: AmazonQ-Dev-RouteTable-USWest2
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref RouteTable
+
+  # Admin Job Role with administrative permissions
+  AdminJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess  # Full admin access
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore  # Required for SSM
+      Path: /
+      RoleName: !Sub "${AWS::StackName}-AdminRole"
+
+  # Instance profile for the admin job role
+  AdminInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref AdminJobRole
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for development instance with SSH, SSM, and VS Code Server access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: Allow SSH access from anywhere
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+          Description: Allow VS Code Server access
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+
+  # Development Instance for Amazon Q Feature Development
+  DevelopmentInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnetA
+      SecurityGroupIds:
+        - !GetAtt InstanceSecurityGroup.GroupId
+      ImageId: ami-0ec1bf4a8f92e7bd1  # Latest Ubuntu 22.04 LTS x86_64 AMI in us-west-2
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref AdminInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref VolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: AmazonQ-Feature-Development
+        - Key: Environment
+          Value: Development
+        - Key: Purpose
+          Value: AmazonQFeatureDevelopment
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          
+          # Update system packages
+          apt-get update
+          apt-get upgrade -y
+          
+          # Install required packages
+          apt-get install -y unzip curl wget jq apt-transport-https ca-certificates software-properties-common gnupg lsb-release build-essential
+
+          # Install Git and GitHub CLI
+          apt-get install -y git
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          apt-get update
+          apt-get install -y gh
+
+          # Install Docker
+          mkdir -p /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+          apt-get update
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+          usermod -aG docker ubuntu
+          systemctl enable docker
+          systemctl start docker
+
+          # Install Docker Compose v2
+          mkdir -p /usr/local/lib/docker/cli-plugins
+          curl -SL "https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-linux-x86_64" -o /usr/local/lib/docker/cli-plugins/docker-compose
+          chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+          ln -sf /usr/local/lib/docker/cli-plugins/docker-compose /usr/local/bin/docker-compose
+
+          # Install AWS CLI
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          ./aws/install
+          
+          # Install AWS CDK
+          npm install -g aws-cdk
+          
+          # Install SSM Agent (required for SSM connectivity)
+          if ! snap list amazon-ssm-agent &>/dev/null; then
+            mkdir -p /tmp/ssm
+            cd /tmp/ssm
+            wget https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/debian_amd64/amazon-ssm-agent.deb
+            dpkg -i amazon-ssm-agent.deb || true
+            systemctl enable amazon-ssm-agent
+            systemctl start amazon-ssm-agent
+          fi
+          
+          # Install Python 3 and pip with development tools
+          apt-get install -y python3 python3-pip python3-venv python3-dev
+          
+          # Install Python development tools
+          pip3 install uv pytest pytest-cov black isort mypy flake8 pylint
+          
+          # Update PATH environment variable for all users
+          echo 'export PATH="$HOME/.local/bin:$PATH"' >> /etc/profile.d/custom_path.sh
+          chmod +x /etc/profile.d/custom_path.sh
+          source /etc/profile.d/custom_path.sh
+          
+          # Also add to .bashrc for the ubuntu user
+          echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/ubuntu/.bashrc
+          chown ubuntu:ubuntu /home/ubuntu/.bashrc
+          
+          # Install Node.js and npm
+          curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+          apt-get install -y nodejs
+          npm install -g npm@latest
+          
+          # Install common global npm packages
+          npm install -g typescript
+          npm install -g @vue/cli
+          npm install -g @angular/cli
+          npm install -g create-react-app
+          npm install -g jest
+          npm install -g eslint
+          npm install -g prettier
+          
+          # Install Visual Studio Code Server
+          curl -fsSL https://code-server.dev/install.sh | sh
+          systemctl enable --now code-server@ubuntu
+          
+          # Configure VS Code Server to be accessible
+          mkdir -p /home/ubuntu/.config/code-server
+          cat > /home/ubuntu/.config/code-server/config.yaml << 'EOT'
+          bind-addr: 0.0.0.0:8080
+          auth: password
+          password: amazonqdev
+          cert: false
+          EOT
+          chown -R ubuntu:ubuntu /home/ubuntu/.config
+          systemctl restart code-server@ubuntu
+          
+          # Install Amazon Q CLI using the .deb package
+          cd /tmp
+          wget https://desktop-release.q.us-east-1.amazonaws.com/latest/amazon-q.deb
+          apt-get install -f -y
+          dpkg -i amazon-q.deb
+          
+          # Set up development directories
+          mkdir -p /home/ubuntu/amazonq-dev
+          mkdir -p /home/ubuntu/amazonq-dev/repos
+          mkdir -p /home/ubuntu/amazonq-dev/tools
+          mkdir -p /home/ubuntu/amazonq-dev/docs
+          chown -R ubuntu:ubuntu /home/ubuntu/amazonq-dev
+          
+          # Create a README file with development instructions
+          cat > /home/ubuntu/amazonq-dev/README.md << 'EOT'
+          # Amazon Q Feature Development Environment
+
+          This environment is set up for Amazon Q feature development with all necessary tools and dependencies.
+
+          ## Development Tools
+
+          - **Amazon Q CLI**: Pre-installed and configured
+          - **Git & GitHub CLI**: For version control and GitHub integration
+          - **Docker & Docker Compose**: For containerized development
+          - **AWS CLI & AWS CDK**: For AWS resource management
+          - **Python 3**: With development tools (pytest, black, isort, etc.)
+          - **Node.js**: With TypeScript and common frameworks
+          - **Visual Studio Code Server**: Browser-based IDE
+
+          ## Getting Started
+
+          1. Access VS Code Server: http://localhost:8080 (Password: amazonqdev)
+          2. Clone repositories into the `~/amazonq-dev/repos` directory
+          3. Set up your development environment in VS Code
+          4. Use Amazon Q CLI with `q` command
+
+          ## Useful Commands
+
+          ```bash
+          # Start a new Amazon Q chat session
+          q chat
+
+          # Clone a repository
+          gh repo clone <owner>/<repo> ~/amazonq-dev/repos/<repo>
+
+          # Run Docker containers
+          cd ~/amazonq-dev/repos/<repo>
+          docker-compose up -d
+          ```
+
+          ## Development Workflow
+
+          1. Create a new feature branch
+          2. Implement your changes
+          3. Write tests for your changes
+          4. Run tests locally
+          5. Submit a pull request
+
+          ## Documentation
+
+          - Amazon Q CLI documentation: https://docs.aws.amazon.com/amazonq/latest/cli-user-guide/
+          - AWS CDK documentation: https://docs.aws.amazon.com/cdk/
+          EOT
+          chown ubuntu:ubuntu /home/ubuntu/amazonq-dev/README.md
+          
+          # Create a welcome message with development environment instructions
+          cat > /etc/motd << 'EOT'
+          
+          =====================================================
+          Welcome to Amazon Q Feature Development Environment
+          =====================================================
+          
+          DEVELOPMENT INSTANCE: This instance is configured for Amazon Q feature development
+          
+          To use Amazon Q CLI:
+            - Run 'q chat' to start a chat session
+            - Run 'q --help' for more options
+          
+          Development Tools:
+            - Git and GitHub CLI
+            - Docker and Docker Compose
+            - AWS CLI and AWS CDK
+            - Python 3 with development tools
+            - Node.js with TypeScript and testing frameworks
+            - Visual Studio Code Server
+          
+          Access VS Code Server:
+            - URL: http://localhost:8080 or http://<PUBLIC_IP>:8080
+            - Password: amazonqdev
+          
+          Development Directories:
+            - Main directory: ~/amazonq-dev
+            - Repositories: ~/amazonq-dev/repos
+            - Tools: ~/amazonq-dev/tools
+            - Documentation: ~/amazonq-dev/docs
+          
+          See ~/amazonq-dev/README.md for more information.
+          
+          =====================================================
+          
+          EOT
+          
+          # Configure SSH for Amazon Q CLI
+          echo "AcceptEnv Q_SET_PARENT" >> /etc/ssh/sshd_config
+          echo "AllowStreamLocalForwarding yes" >> /etc/ssh/sshd_config
+          systemctl restart sshd
+          
+          # Install Q CLI dotfile integration
+          sudo -u ubuntu q integrations install dotfile
+          
+          # Open port 8080 for VS Code Server
+          ufw allow 8080/tcp
+          
+          # Tag the instance
+          INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+          REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+          aws ec2 create-tags --resources $INSTANCE_ID --tags Key=Name,Value=AmazonQ-Feature-Development Key=Environment,Value=Development --region $REGION
+
+Outputs:
+  InstanceId:
+    Description: ID of the Development Instance
+    Value: !Ref DevelopmentInstance
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceId"
+
+  PublicIP:
+    Description: Public IP address of the Development Instance
+    Value: !GetAtt DevelopmentInstance.PublicIp
+    Export:
+      Name: !Sub "${AWS::StackName}-PublicIP"
+
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${AWS::StackName}-VPCId"
+
+  SecurityGroupId:
+    Description: Security Group ID
+    Value: !Ref InstanceSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroupId"
+
+  KeyPairName:
+    Description: SSH Key Pair Name
+    Value: !Ref KeyName
+    Export:
+      Name: !Sub "${AWS::StackName}-KeyPairName"
+
+  Region:
+    Description: Deployment Region
+    Value: !Ref "AWS::Region"
+    Export:
+      Name: !Sub "${AWS::StackName}-Region"
+
+  InstanceType:
+    Description: Instance type used
+    Value: !Ref InstanceType
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceType"
+
+  VSCodeServerURL:
+    Description: URL for accessing VS Code Server
+    Value: !Sub "http://${DevelopmentInstance.PublicIp}:8080"
+    Export:
+      Name: !Sub "${AWS::StackName}-VSCodeServerURL"

@@ -1,0 +1,217 @@
+#!/bin/bash
+#
+# amazonq - Command line tool for Amazon Q CLI development and deployment
+#
+# This script provides functionality for Amazon Q CLI feature development
+# and deployment on AWS EC2 spot instances.
+#
+
+set -e
+
+# Configuration
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STACK_NAME="amazon-q-spot-instance-uswest2"
+TEMPLATE_FILE="spot-qcli-template-uswest2.yaml"
+REGION="us-west-2"
+SPOT_PRICE="0.25"
+KEY_NAME="amazon-q-key-uswest2"
+DEV_STACK_NAME="amazon-q-dev-instance-uswest2"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Display help information
+show_help() {
+    echo -e "${BLUE}Amazon Q CLI Development and Deployment Tool${NC}"
+    echo ""
+    echo "Usage: ./amazonq [command] [options]"
+    echo ""
+    echo "Commands:"
+    echo "  feature-development    Deploy a development environment for Amazon Q feature development"
+    echo "  deploy                 Deploy a standard Amazon Q CLI environment"
+    echo "  help                   Show this help message"
+    echo ""
+    echo "Options for feature-development:"
+    echo "  --instance-type TYPE   Specify instance type (default: m5.4xlarge)"
+    echo "  --volume-size SIZE     Specify EBS volume size in GB (default: 100)"
+    echo "  --region REGION        Specify AWS region (default: us-west-2)"
+    echo ""
+    echo "Examples:"
+    echo "  ./amazonq feature-development"
+    echo "  ./amazonq feature-development --instance-type m5.4xlarge --volume-size 100"
+    echo "  ./amazonq deploy"
+    echo ""
+}
+
+# Check if AWS CLI is installed
+check_aws_cli() {
+    if ! command -v aws &> /dev/null; then
+        echo -e "${RED}Error: AWS CLI is not installed. Please install it first.${NC}"
+        exit 1
+    fi
+}
+
+# Check if template file exists
+check_template_file() {
+    if [ ! -f "$SCRIPT_DIR/$TEMPLATE_FILE" ]; then
+        echo -e "${RED}Error: Template file $TEMPLATE_FILE not found.${NC}"
+        exit 1
+    fi
+}
+
+# Deploy standard environment using the existing script
+deploy_standard() {
+    echo -e "${GREEN}Deploying standard Amazon Q CLI environment...${NC}"
+    $SCRIPT_DIR/deploy-spot-qcli-uswest2.sh
+}
+
+# Deploy feature development environment
+deploy_feature_development() {
+    local instance_type="m5.4xlarge"
+    local volume_size="100"
+    local region="$REGION"
+    
+    # Parse arguments
+    while [[ "$#" -gt 0 ]]; do
+        case $1 in
+            --instance-type)
+                instance_type="$2"
+                shift 2
+                ;;
+            --volume-size)
+                volume_size="$2"
+                shift 2
+                ;;
+            --region)
+                region="$2"
+                shift 2
+                ;;
+            *)
+                echo -e "${RED}Unknown parameter: $1${NC}"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+    
+    echo -e "${GREEN}Deploying Amazon Q feature development environment...${NC}"
+    echo -e "${BLUE}Instance Type:${NC} $instance_type"
+    echo -e "${BLUE}Volume Size:${NC} $volume_size GB"
+    echo -e "${BLUE}Region:${NC} $region"
+    
+    # Delete existing development stack if it exists
+    if aws cloudformation describe-stacks --stack-name $DEV_STACK_NAME --region $region &> /dev/null; then
+        echo -e "${YELLOW}Deleting existing development stack $DEV_STACK_NAME...${NC}"
+        aws cloudformation delete-stack --stack-name $DEV_STACK_NAME --region $region
+        echo -e "${YELLOW}Waiting for stack deletion to complete...${NC}"
+        aws cloudformation wait stack-delete-complete --stack-name $DEV_STACK_NAME --region $region
+    fi
+    
+    # Deploy CloudFormation stack for development
+    echo -e "${GREEN}Deploying CloudFormation stack $DEV_STACK_NAME in region $region...${NC}"
+    echo -e "${BLUE}Using instance type:${NC} $instance_type"
+    echo -e "${BLUE}With EBS volume size:${NC} $volume_size GB"
+    
+    aws cloudformation create-stack \
+        --stack-name $DEV_STACK_NAME \
+        --template-body file://$SCRIPT_DIR/amazonq-dev-template-uswest2.yaml \
+        --parameters \
+            ParameterKey=SpotPrice,ParameterValue=$SPOT_PRICE \
+            ParameterKey=KeyName,ParameterValue=$KEY_NAME \
+            ParameterKey=InstanceType,ParameterValue=$instance_type \
+            ParameterKey=VolumeSize,ParameterValue=$volume_size \
+        --capabilities CAPABILITY_NAMED_IAM \
+        --region $region \
+        --tags Key=Purpose,Value=AmazonQFeatureDevelopment
+    
+    # Wait for stack creation to complete
+    echo -e "${YELLOW}Waiting for stack creation to complete...${NC}"
+    aws cloudformation wait stack-create-complete --stack-name $DEV_STACK_NAME --region $region
+    
+    # Get stack outputs
+    echo -e "${GREEN}Stack creation completed. Getting instance details...${NC}"
+    
+    # Get instance ID
+    INSTANCE_ID=$(aws cloudformation describe-stacks --stack-name $DEV_STACK_NAME --region $region --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" --output text)
+    
+    if [ -n "$INSTANCE_ID" ]; then
+        echo -e "${GREEN}Instance ID: $INSTANCE_ID${NC}"
+        
+        # Get public IP address
+        PUBLIC_IP=$(aws ec2 describe-instances --instance-ids $INSTANCE_ID --region $region --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
+        
+        if [ "$PUBLIC_IP" != "None" ] && [ "$PUBLIC_IP" != "null" ]; then
+            echo -e "${GREEN}Public IP: $PUBLIC_IP${NC}"
+            echo -e "${BLUE}SSH Command:${NC} ssh -i $KEY_NAME.pem ubuntu@$PUBLIC_IP"
+            echo -e "${BLUE}SSM Command:${NC} aws ssm start-session --target $INSTANCE_ID --region $region"
+            
+            echo ""
+            echo -e "${GREEN}=== Development Environment Setup ===${NC}"
+            echo -e "${BLUE}The development environment includes:${NC}"
+            echo "- Amazon Q CLI pre-installed"
+            echo "- Git and GitHub CLI"
+            echo "- Docker and Docker Compose"
+            echo "- AWS CLI and AWS CDK"
+            echo "- Python 3 with development tools"
+            echo "- Node.js with TypeScript"
+            echo "- Visual Studio Code Server (access via browser)"
+            echo "- Development directories and repositories"
+            echo ""
+            echo -e "${YELLOW}Note: It may take a few minutes for all development tools to be installed.${NC}"
+            echo -e "${YELLOW}You can check the installation progress with:${NC}"
+            echo "ssh -i $KEY_NAME.pem ubuntu@$PUBLIC_IP 'tail -f /var/log/cloud-init-output.log'"
+        else
+            echo -e "${RED}Failed to get public IP address${NC}"
+        fi
+    else
+        echo -e "${RED}Failed to get instance ID${NC}"
+    fi
+    
+    echo ""
+    echo -e "${GREEN}=== Deployment Summary ===${NC}"
+    echo -e "${BLUE}Stack Name:${NC} $DEV_STACK_NAME"
+    echo -e "${BLUE}Region:${NC} $region"
+    echo -e "${BLUE}Instance Type:${NC} $instance_type"
+    echo -e "${BLUE}Volume Size:${NC} $volume_size GB"
+    echo -e "${BLUE}Key Pair:${NC} $KEY_NAME"
+    echo ""
+    echo -e "${GREEN}Feature development environment deployed successfully!${NC}"
+}
+
+# Main script execution
+main() {
+    # Check for required tools
+    check_aws_cli
+    check_template_file
+    
+    # Parse command
+    case "$1" in
+        feature-development)
+            shift
+            deploy_feature_development "$@"
+            ;;
+        deploy)
+            deploy_standard
+            ;;
+        help)
+            show_help
+            ;;
+        "")
+            echo -e "${RED}Error: No command specified${NC}"
+            show_help
+            exit 1
+            ;;
+        *)
+            echo -e "${RED}Error: Unknown command: $1${NC}"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+# Execute main function
+main "$@"

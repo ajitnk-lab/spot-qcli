@@ -15,6 +15,12 @@ cd /home/ubuntu/spot-qcli
 ./deploy-spot-qcli-uswest2.sh
 ```
 
+### Feature Development Environment
+```bash
+cd /home/ubuntu/spot-qcli
+./amazonq feature-development
+```
+
 ### SSH to Instance
 ```bash
 ssh -i amazon-q-key-uswest2.pem ubuntu@<INSTANCE_IP>
@@ -30,7 +36,9 @@ ssh -i amazon-q-key-uswest2.pem -o ConnectTimeout=15 -o StrictHostKeyChecking=no
 | File | Description |
 |------|-------------|
 | `spot-qcli-template-uswest2.yaml` | CloudFormation template with mixed instance types |
+| `amazonq-dev-template-uswest2.yaml` | CloudFormation template for feature development |
 | `deploy-spot-qcli-uswest2.sh` | Automated deployment script |
+| `amazonq` | Command-line tool for Amazon Q CLI development and deployment |
 | `amazon-q-key-uswest2.pem` | SSH private key for instance access |
 | `setup-ssh-keys.sh` | SSH key management and validation script |
 
@@ -67,15 +75,36 @@ If you need to recreate SSH keys:
 ```
 
 ### 2. Deploy Infrastructure
+For standard deployment:
 ```bash
 ./deploy-spot-qcli-uswest2.sh
 ```
 
-The script will:
+For feature development environment:
+```bash
+./amazonq feature-development
+```
+
+You can customize the feature development environment:
+```bash
+./amazonq feature-development --instance-type m5.4xlarge --volume-size 100
+```
+
+The standard deployment script will:
 - Delete any existing stack
 - Deploy new CloudFormation stack
 - Wait for completion
 - Display instance details and access commands
+
+The feature development environment includes:
+- Amazon Q CLI pre-installed and configured
+- Git and GitHub CLI for version control
+- Docker and Docker Compose for containerized development
+- AWS CLI and AWS CDK for AWS resource management
+- Python 3 with development tools (pytest, black, isort, etc.)
+- Node.js with TypeScript and testing frameworks
+- Visual Studio Code Server (accessible via browser)
+- Development directories and repositories
 
 ### 3. Access Your Instance
 Once deployed, you'll get output like:
